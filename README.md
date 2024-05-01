@@ -2,4 +2,4 @@ The project involved forecasting the daily demand of lettuce in four individual 
 
 code.Rmd file contains the R code
 
-report.html file contains the report (code + conclusions), in order to correctly visualize it, you can access it here: https://htmlpreview.github.io/?https://github.com/anar39/Forecasting-Project/blob/main/report.html
+report.html file contains the report (code + conclusions) -> In order to correctly visualize it, you can access it here: https://htmlpreview.github.io/?https://github.com/anar39/Forecasting-Project/blob/main/report.html
