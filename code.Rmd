@@ -1,0 +1,703 @@
+---
+title: "Individual Project: Demand Forecasting for a Fast-Food Restaurant Chain"
+author: 'Ana Rodrigo de Pablo, CID: 02490419'
+output:
+  html_document: default
+---
+
+```{r, include=FALSE}
+library(dplyr)
+library(readxl)
+library(lubridate)
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+library(forecast)
+library(tseries)
+library(ggplot2)
+```
+
+## Data Pre-processing
+
+The objective of this project is to forecast the daily demand of lettuce in 4 stores from 16/06/2015 to 29/06/2015, so that managers can take inventory replenishment decisions.
+
+Before jumping into forecasting, I have first processed all the data stored in a total of 11 tables so that I could calculate the daily demand of lettuce for our data observation window (from 05/03/2015 to 15/06/2015) and then build a time series.
+
+```{r, include=FALSE}
+ingredients <- read.csv("ingredients.csv")
+menu_items <- read.csv("menu_items.csv")
+menuitem <- read.csv("menuitem.csv")
+portion_uom_types <- read.csv("portion_uom_types.csv")
+pos_ordersale <- read.csv("pos_ordersale.csv")
+recipe_ingredient_assignments <- read.csv("recipe_ingredient_assignments.csv")
+recipe_sub_recipe_assignments <- read.csv("recipe_sub_recipe_assignments.csv")
+recipes <- read.csv("recipes.csv")
+store_restaurant <- read_excel("store_restaurant.xlsx")
+sub_recipe_ingr_assignments <- read.csv("sub_recipe_ingr_assignments.csv")
+sub_recipes <- read.csv("sub_recipes.csv")
+```
+
+In order to do this, I have first merge all the tables and then selected only those observations whose 'IngredientId' is lettuce (either 27 or 291). After this, I have calculated the total consumption of lettuce per order by multiplying the quantity of menus ordered times the quantity of lettuce in the recipe.
+
+```{r}
+# Merge relevant tables
+merged_data_1 <- merge(pos_ordersale, menuitem, by = "MD5KEY_ORDERSALE", suffixes = c("", ".y"))
+merged_data_1 <- merged_data_1 %>%
+  select(-ends_with(".y"))
+merged_data_1 <- merge(merged_data_1, menu_items, by.x = c("PLU", "Id"), by.y = c("PLU", "MenuItemId"))
+merged_data_1 <- merge(merged_data_1, recipe_ingredient_assignments, by = "RecipeId")
+merged_data_1 <- merge(merged_data_1, ingredients, by = "IngredientId")
+merged_data_1 <- merge(merged_data_1, portion_uom_types, by = "PortionUOMTypeId")
+
+# Filter observations for lettuce only
+filtered_data <- merged_data_1 %>%
+  filter(IngredientId %in% c(27, 291))
+
+# Rename columns
+filtered_data <- filtered_data %>%
+  rename(
+    Quantity_of_menus_ordered = Quantity.x,
+    Quantity_of_ingredient_used_in_recipe = Quantity.y)
+
+# Calculate total consumption of lettuce per POS
+filtered_data <- filtered_data %>%
+  mutate(total_lettuce = Quantity_of_menus_ordered * Quantity_of_ingredient_used_in_recipe)
+```
+
+The same process has been followed for all the sub-recipes. Then, I have merged both tables (recipes and sub-recipes) and aggregated the demand of lettuce by day and store.
+
+```{r}
+# Merge relevant tables
+merged_data_2 <- merge(pos_ordersale, menuitem, by = "MD5KEY_ORDERSALE", suffixes = c("", ".y"))
+merged_data_2 <- merged_data_2 %>%
+  select(-ends_with(".y"))
+merged_data_2 <- merge(merged_data_2, menu_items, by.x = c("PLU", "Id"), by.y = c("PLU", "MenuItemId"))
+merged_data_2 <- merge(merged_data_2, recipe_sub_recipe_assignments, by = "RecipeId")
+merged_data_2 <- merge(merged_data_2, sub_recipe_ingr_assignments, by = "SubRecipeId")
+merged_data_2 <- merge(merged_data_2, ingredients, by = "IngredientId")
+merged_data_2 <- merge(merged_data_2, portion_uom_types, by = "PortionUOMTypeId")
+
+# Filter observations for lettuce only
+filtered_data_2 <- merged_data_2 %>%
+  filter(IngredientId %in% c(27, 291))
+
+# Rename columns
+filtered_data_2 <- filtered_data_2 %>%
+  rename(
+    Quantity_of_menus_ordered = Quantity.x,
+    Quantity_of_subrecipe_used_in_recipe = Factor,
+    Quantity_of_ingredient_used_in_subrecipe = Quantity.y)
+
+# Calculate total consumption of lettuce per POS
+filtered_data_2 <- filtered_data_2 %>%
+  mutate(total_lettuce = Quantity_of_menus_ordered * Quantity_of_subrecipe_used_in_recipe * Quantity_of_ingredient_used_in_subrecipe)
+
+# Combine tables
+combined_data <- bind_rows(filtered_data, filtered_data_2)
+
+# Aggregate data to get daily lettuce demand
+lettuce_demand <- combined_data %>%
+  group_by(StoreNumber, date) %>%
+  summarise(daily_demand = sum(total_lettuce), .groups = "drop")
+```
+
+Finally, I have formatted the dataset for easier readability (date format, split by store, NAs etc). Below you can see a snippet of the 10 first observations. This is the dataset I will use to forecast the demand and discuss the different models.
+
+```{r}
+# Convert the date column to date format
+lettuce_demand$date <- as.Date(lettuce_demand$date, format = "%y-%m-%d")
+
+# Pivot the data to wide format
+wide_data <- lettuce_demand %>%
+  pivot_wider(names_from = StoreNumber,
+              values_from = daily_demand,
+              names_prefix = "Store_") %>%
+  mutate(date = as.character(date)) %>%
+  arrange(date)
+
+# Replace 0 with NA
+wide_data <- wide_data %>%
+  mutate(across(starts_with("Store_"), ~ replace(., . == 0, NA)))
+
+# Visualize final output
+table <- kable(wide_data[1:10, ], format = "html", caption = "First 10 rows of daily demand of lettuce") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+table
+```
+
+## Model Evaluation (Holt-Winters and ARIMA)
+
+In order to forecast the demand for the 4 individual stores I have split the observations into a training and a test set. As I am basing my predictions on the last 3.5 months of data (roughly 100 observations per store) and I am pursuing a 14 days forecast, my test set will contain the last 14 observations and the training set all previous observations available.
+
+### Store 46673
+
+I will first start with store number 46673 for which I have data for all days from 05/03/2015 to 15/06/2015. From the graph below we see that data for this store contains a seasonal factor (we observe a consistent pattern of variation that occurs at regular intervals over a specific period of days, the importance of it is determined by the short bar at the right of the 'seasonal' plot), whereas not a such strong trend component.
+
+```{r, include=FALSE}
+data <- read.csv(file = "wide_data.csv", header = TRUE)
+```
+
+```{r}
+# Create time series
+lettuce_46673 <- ts(data[, 6], frequency = 7)
+lettuce_46673 %>% stl(s.window = "period") %>% autoplot
+
+# Training-test split
+lettuce_46673.train <- window(lettuce_46673, end = c(13, 5))
+lettuce_46673.test <- window(lettuce_46673, start = c(13, 6))
+```
+
+I will continue by applying Holt-Winters model to my training set. To perform Holt-Winters analysis, I need to use both $HoltWinters$ and $ets$ functions to identify the systematic components in the data while minimizing forecast errors.
+
+ETS results (i.e. ETS(A,N,A)) demonstrate the additive error type, no trend, and the additive seasonal factor. Whereas the Holt-Winters model has exponential smoothing with trend and additive seasonal component. Looking at the graph below, it seems that both the $ETS$ and $Holt Winters$ models fit well the training set, correctly matching the true values except for some higher increases of demand.
+
+```{r, warning=FALSE}
+lettuce_46673.HW <- HoltWinters(lettuce_46673.train)
+lettuce_46673.ets <- ets(lettuce_46673.train, model = "ZZZ") # Output: ETS(A,N,A) 
+
+plot(lettuce_46673.HW, ylim = c(50, 260), main = "Holt-Winters and ETS Fitted Values for Store 46673")
+lines(fitted(lettuce_46673.ets), col = "blue")
+legend("topright",c("True value", "HW fitted", "ETS fitted"), lty = 1, col = c("black","red", "blue"))
+```
+
+When it comes to forecasting the daily demand for the last 14 days of our dataset (i.e. test set), both models seem to be working quite well except for the spikes, which none of them is able to capture. However, spikes could be considered unpredictable outliers.
+
+```{r}
+lettuce_46673.HW_forecast <- forecast(lettuce_46673.HW, h = 14)
+lettuce_46673.ets_forecast <- forecast(lettuce_46673.ets, h = 14)
+
+plot(lettuce_46673.HW_forecast, ylim = c(0, 250), main = "Store 46673 Forecast")
+lines(lettuce_46673)
+lines(lettuce_46673.ets_forecast$mean, col = "red")
+legend("bottomleft",c("HW FCST", "ETS FCST"), lty= 1, col = c("blue","red"))
+```
+
+I will now move into the application of ARIMA model. First, I must ensure the stationarity of my time series. To check this I execute ADF, PP, and KPSS tests. The results from the ADF and PP tests show that the store 46673 train data is stationary (p-value is less than the 0.05 significance level, hence we can reject the null hypothesis of non-stationarity). In addition, KPSS test also suggests stationarity as p-value (0.1) is greater than the significance level (0.05) and hence we fail to reject the null hypothesis that in this case is the time series being stationary.
+
+Overall, the results suggest that we do not need to take any difference as the time series for store 46673 is already stationary.
+
+```{r, warning=FALSE}
+adf.test(lettuce_46673.train)
+pp.test(lettuce_46673.train)
+kpss.test(lettuce_46673.train)
+```
+
+To confirm my previous assumption about the differences, I then execute the function $ndiffs$. I get an outcome of zero, which means that the time series does not exhibit any trend or systematic patterns that needs to be differenced to achieve stationarity. I conclude that taking a difference is not necessary and hence the data for store 46673 is stationary.
+
+```{r}
+ndiffs(lettuce_46673.train)
+```
+
+For time series modeling techniques that require stationary data, such as ARIMA models, removing seasonality is essential. However, $ndiffs$ function does not consider seasonal differences. To determine the number of seasonal differences needed to achieve stationarity in my time series I execute the function $nsdiffs$.
+
+As aligned with our initial observation, the output suggests that one seasonal difference may be needed to achieve stationarity in my time series data.
+
+```{r}
+nsdiffs(lettuce_46673.train)
+```
+
+Previous two functions have helped me determine d and D, respectively.
+
+Now that I have confirmed the stationarity of my time series data and determined that no differencing is needed for the overall trend but one seasonal difference may be required, I will proceed with further exploratory analysis.
+
+I will use $ggacf$ and $ggpacf$ functions to analyze the autocorrelation and partial autocorrelation functions of my time series for store 46673. The plots below provide insights into the underlying patterns and help identify potential orders for ARIMA modeling. They help visualizing the values of q and p, respectively.
+
+From the ACF graph we see that every 7, 14, and 21 days there is a spike. Reinforcing the idea that there might be a seasonal factor in the time series data as observed in $ETS$ and $HW$ modeling.
+
+```{r}
+ggAcf(lettuce_46673.train) # Significant at any lag until q = 9
+ggPacf(lettuce_46673.train) # Significant for p <= 2
+```
+
+The graphs above provide me an idea of the possible inputs for my future ARIMA model (i.e. ARIMA(p,d,q)(P,D,Q)); however, the most straight forward approach is to execute the function $auto.arima$ to get the best and subsequent best models.
+
+```{r}
+# Values of d and D are the output of ndiffs and nsdiffs, respectively
+auto.arima(lettuce_46673.train, trace = TRUE, d = 0, D = 1)
+```
+
+By using the $auto.arima$ function, I have the parameters for the best model, second and third best models (I am extending the selection up to three models as their AICc values are quite close):
+
+1.  Best model: ARIMA(0,0,1)(0,1,1)[7] -\> AICc = 775.798
+
+2.  Second best model: ARIMA(1,0,0)(0,1,1)[7] -\> AICc = 775.9378
+
+3.  Third best model: ARIMA(0,0,0)(0,1,1)[7] -\> AICc = 776.4867
+
+I am evaluating the models' performance using AICc information criteria (lower AICc = better performance). AICc has a penalty, hence it works better for small datasets as mine.
+
+```{r}
+# three candidate models
+store_46673.m1 <- Arima(lettuce_46673.train, order = c(0, 0, 1), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+
+store_46673.m2 <- Arima(lettuce_46673.train, order = c(1, 0, 0), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+
+store_46673.m3 <- Arima(lettuce_46673.train, order = c(0, 0, 0), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+```
+
+The next step is to perform residual analysis, a post-estimation analysis to see if the model fits the data well. I will check if the residuals of each model follow the white noise process, which means the residuals are independent from the time series data. The output printed below provides insights on this. Ljung-Box test is used to check if the residuals are random. The null hypothesis is that the residuals are random, which is good as it means that they do no follow a clear pattern.
+
+The first and second model have a p-value = 0.2486, which means that I fail to reject the null and conclude that the time series residuals satisfy the white noise process. Whereas the third model has a p-value (0.04719) smaller than the significance level (0.05), which implies rejecting the null hypothesis.
+
+Therefore, the first two models are valid to forecast store 46673, and I will drop the third model from the analysis.
+
+```{r}
+checkresiduals(store_46673.m1)
+checkresiduals(store_46673.m2)
+checkresiduals(store_46673.m3)
+```
+
+Finally, I will create the forecast for these two models using the $forecast$ function, whose accuracy will be evaluated later on.
+
+```{r}
+store_46673.m1_forecast <- forecast(store_46673.m1, h = 14)
+store_46673.m2_forecast <- forecast(store_46673.m2, h = 14)
+```
+
+### Store 12631
+
+Next, let's explore the data for store number 12631 for which I also have observations for all days from 05/03/2015 to 15/06/2015. In this case, it is hard to identify a trend or seasonal significance (the bars on the right are quite large, indicating less importance).
+
+```{r}
+# Create time series
+lettuce_12631 <- ts(data[, 4], frequency = 7)
+lettuce_12631 %>% stl(s.window = "period") %>% autoplot 
+
+# Training-test split
+lettuce_12631.train <- window(lettuce_12631, end = c(13, 5))
+lettuce_12631.test <- window(lettuce_12631, start = c(13, 6))
+```
+
+As before, to perform the Holt-Winters analysis, I use both $HoltWinters$ and $ets$ functions. The result of $ets$ (i.e. ETS(M,Ad,M)), indicates the multiplicative error type, additive trend, and the multiplicative seasonality. On the other side, the Holt-Winters model has exponential smoothing with trend and additive seasonal component.
+
+```{r}
+lettuce_12631.HW <- HoltWinters(lettuce_12631.train)
+lettuce_12631.ets <- ets(lettuce_12631.train, model = "ZZZ") # Output: ETS(M,Ad,M)
+
+plot(lettuce_12631.HW, ylim = c(150, 400), main = "Holt-Winters and ETS Fitted Values for Store 12631")
+lines(fitted(lettuce_12631.ets), col = "blue")
+legend("topleft",c("True value", "HW fitted", "ETS fitted"), lty = 1, col = c("black","red", "blue"))
+```
+
+When it comes to forecasting the daily demand for the last 14 days of our dataset (i.e. test set), both models overforecast the first days of the test set, although they seem to have an accurate prediction for the rest. Similarly to store 46673, they fail to forecast big spikes.
+
+```{r}
+lettuce_12631.HW_forecast <- forecast(lettuce_12631.HW, h = 14)
+lettuce_12631.ets_forecast <- forecast(lettuce_12631.ets, h = 14)
+
+plot(lettuce_12631.HW_forecast, ylim = c(150, 420), main = "Store 12631 Forecast")
+lines(lettuce_12631)
+lines(lettuce_12631.ets_forecast$mean, col = "red")
+legend("topleft",c("HW FCST", "ETS FCST"), lty= 1, col = c("blue","red"))
+```
+
+I will now move into the application of ARIMA model. I start by checking the stationarity of the time series. The results from ADF and PP tests indicate the time series is stationary (p-value \< significance level, indicating strong evidence against the null hypothesis of non-stationarity).
+
+On the other hand, the KPSS test points out that it is not stationary by indicating that the p-value is smaller than the significance, which rejects the null hypothesis of being stationary.
+
+```{r, warning=FALSE}
+adf.test(lettuce_12631.train)
+pp.test(lettuce_12631.train)
+kpss.test(lettuce_12631.train)
+```
+
+The results of ADF, PP and KPSS are contradictory. To conclude whether the time series is or not stationary, I execute the $ndiffs$ function. It indicates that I need to take the first order difference. After differencing, the $ndiffs$ output is 0, which means we do not need any more difference to achieve stationarity.
+
+```{r}
+ndiffs(lettuce_12631.train)
+lettuce_12631.train_diff1 <- diff(lettuce_12631.train, differences = 1)
+ndiffs(lettuce_12631.train_diff1)
+```
+
+Moreover, if we execute ADF, PP and KPSS tests again using the time series after taking the first difference, we see how the time series is now stationary (these results have been examined but not printed in this report).
+
+```{r, include = FALSE}
+adf.test(lettuce_12631.train_diff1)
+pp.test(lettuce_12631.train_diff1)
+kpss.test(lettuce_12631.train_diff1)
+```
+
+Now, I move into executing the function $nsdiffs$ to determine the number of seasonal differences needed to achieve stationarity in my time series. The result points out that I do not need to take a difference in seasonality.
+
+```{r}
+nsdiffs(lettuce_12631.train)
+```
+
+I have so far determined d = 1 and D = 0. To continue, I will create ACF and PACF plots based on the diff1 time series. From the plots below moving average 1 (MA1) could be a potential candidate model because there is one spike at 1 in the ACF graph, and the values at the PACF graph decrease exponentially.
+
+Despite the non-seasonality difference suggested by $nsdiff$ function, there are some spikes on 7, 14, and 21 in a similar fashion as it happened for store 46673, which might indicate that the time series is not stationary in terms of seasonality. Finally, the 'seasonal' graph also suggests that there might be seasonal factors in the dataset as it shows a shorter gray bar which indicates the higher probability of significance.
+
+```{r}
+ggtsdisplay(lettuce_12631.train_diff1) 
+lettuce_12631.train_diff1 %>% stl(s.window = "period") %>% autoplot
+```
+
+To overcome this doubts with respect to D value, I will build different models with and without the seasonal difference using the $auto.arima$ function.
+
+```{r}
+auto.arima(lettuce_12631.train, trace = TRUE, d = 1, D = 0)
+```
+
+```{r}
+auto.arima(lettuce_12631.train, trace = TRUE, d = 1, D = 1)
+```
+
+The best and second-best models reported are:
+
+1.  Best model: ARIMA(0,1,1)(2,0,0)[7] -\> AICc = 912.8614
+
+2.  Second best: ARIMA(1,1,1)(2,0,0)[7] -\> AICc = 914.4597
+
+3.  Best model: ARIMA(0,1,1)(0,1,1)[7] -\> AICc = 841.9876
+
+4.  Second best: ARIMA(1,1,1)(0,1,1)[7] -\> AICc = 844.0699
+
+I will proceed by building these models using the $Arima$ function and analyze their residuals.
+
+```{r}
+# four candidate models
+store_12631.m1 <- Arima(lettuce_12631.train, order = c(0, 1, 1), seasonal = list(order = c(2, 0, 0), period = 7), include.drift = FALSE)
+
+store_12631.m2 <- Arima(lettuce_12631.train, order = c(1, 1, 1), seasonal = list(order = c(2, 0, 0), period = 7), include.drift = FALSE)
+
+store_12631.m3 <- Arima(lettuce_12631.train, order = c(0, 1, 1), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+
+store_12631.m4 <- Arima(lettuce_12631.train, order = c(1, 1, 1), seasonal = list(order = c(0, 1, 1), period = 7), include.drift = FALSE)
+```
+
+```{r}
+checkresiduals(store_12631.m1, plot = FALSE)
+checkresiduals(store_12631.m2, plot = FALSE)
+checkresiduals(store_12631.m3, plot = FALSE)
+checkresiduals(store_12631.m4, plot = FALSE)
+```
+
+Ljung-Box test shows that all four models have a quite high p-value, which means that I fail to reject the null and conclude that the residuals are random (they do no follow a clear pattern). Therefore, the four models are valid to forecast the time series.
+
+As before, I will create the forecast for the four models, whose accuracy will be evaluated later on.
+
+```{r}
+store_12631.m1_forecast <- forecast(store_12631.m1, h = 14)
+store_12631.m2_forecast <- forecast(store_12631.m2, h = 14)
+store_12631.m3_forecast <- forecast(store_12631.m3, h = 14)
+store_12631.m4_forecast <- forecast(store_12631.m4, h = 14)
+```
+
+### Store 4904
+
+My next store to explore will be store 4904 for which I have made the decision to remove all observations from 05/03/2015 to 12/03/2015 as we do not have any data for these days. It could be that the store was launched on 13/03/2015 hence considering 0 lettuce consumption could negatively affect our predictions.
+
+For this store, neither a trend nor a seasonality are observed in the graphs below.
+
+```{r}
+# Create time series starting after the first 8 NA values
+lettuce_4904 <- ts(na.omit(data[, 3]), frequency = 7)
+lettuce_4904 %>% stl(s.window = "period") %>% autoplot 
+
+# Training-test split
+lettuce_4904.train <- window(lettuce_4904, end = c(12, 4))
+lettuce_4904.test <- window(lettuce_4904, start = c(12, 5))
+```
+
+The results from Holt-Winters analysis indicates an additive error type, no trend, and additive seasonality after executing the $ets$ function. On the other side, the Holt-Winters model shows exponential smoothing with trend and additive seasonal component.
+
+As plotted below, the fitted values from the both models seem to match the true value quite well, except for the last observations in which the discrepancies are bigger.
+
+```{r}
+lettuce_4904.HW <- HoltWinters(lettuce_4904.train)
+lettuce_4904.ets <- ets(lettuce_4904.train, model = "ZZZ") # Output: ETS(A,N,A)
+
+plot(lettuce_4904.HW, ylim = c(150, 550), main = "Holt-Winters and ETS Fitted Values for Store 4904")
+lines(fitted(lettuce_4904.ets), col = "blue")
+legend("topleft",c("True value", "HW fitted", "ETS fitted"), lty = 1, col = c("black","red", "blue"))
+```
+
+In terms of forecast, both models seems to predict the true values quite accurately. We observe that Holt-Winters predicts slightly better the upper spikes, while ETS explains better the lower spikes.
+
+```{r}
+lettuce_4904.HW_forecast <- forecast(lettuce_4904.HW, h = 14)
+lettuce_4904.ets_forecast <- forecast(lettuce_4904.ets, h = 14)
+
+plot(lettuce_4904.HW_forecast, ylim = c(150, 500), main = "Store 4904 Forecast")
+lines(lettuce_4904)
+lines(lettuce_4904.ets_forecast$mean, col = "red")
+legend("topleft",c("HW FCST", "ETS FCST"), lty= 1, col = c("blue","red"))
+```
+
+As with the previous two stores, I will now move into the application of ARIMA model. According to ADF, PP, and KPSS tests the training set is stationary and we do not need to take any first order difference. This is further confirmed by the $ndiffs$ function.
+
+```{r, warning=FALSE}
+adf.test(lettuce_4904.train)
+pp.test(lettuce_4904.train)
+kpss.test(lettuce_4904.train)
+```
+
+```{r}
+ndiffs(lettuce_4904.train)
+```
+
+Despite my first intuition that this store didn't show any trend nor a seasonality, $nsdiffs$ function shows that I do need to take the first order difference (i.e. D=1). Indeed, if we look at the ACF plot below, there is a seasonality factor observed by the spikes on 3, 7, 11, 14, 18, or 21. In addition, both the ACF and PACF decay exponentially, which suggests that ARMA(1, 1) could be a good fit for the data.
+
+```{r}
+nsdiffs(lettuce_4904.train)
+```
+
+```{r}
+ggtsdisplay(lettuce_4904.train)
+```
+
+To confirm all my previous assumptions I will analyze the best and subsequent best models suggested by the $auto.arima$ function, then build them using the $Arima$ function, and finally check its residuals (all these results are shown below).
+
+```{r}
+auto.arima(lettuce_4904.train, trace = TRUE, d = 0, D = 1)
+```
+
+```{r}
+# three candidate models
+store_4904.m1 <- Arima(lettuce_4904.train, order = c(1, 0, 2), seasonal = list(order = c(2, 1, 0), period = 7), include.drift = FALSE)
+
+store_4904.m2 <- Arima(lettuce_4904.train, order = c(1, 0, 1), seasonal = list(order = c(2, 1, 0), period = 7), include.drift = FALSE)
+
+store_4904.m3 <- Arima(lettuce_4904.train, order = c(2, 0, 1), seasonal = list(order = c(2, 1, 0), period = 7), include.drift = FALSE)
+```
+
+```{r}
+checkresiduals(store_4904.m1, plot = FALSE)
+checkresiduals(store_4904.m2, plot = FALSE)
+checkresiduals(store_4904.m3, plot = FALSE)
+```
+
+The three best models suggested by $auto.arima$ function are:
+
+1.  Best model: ARIMA(1,0,2)(2,1,0)[7] -\> AICc = 805.0495
+
+2.  Second best model: ARIMA(1,0,1)(2,1,0)[7] -\> AICc = 805.3115
+
+3.  Third best model: ARIMA(2,0,1)(2,1,0)[7] -\> AICc = 805.3311
+
+Residual analysis shows that model 1 and 2 have a p-value smaller than our significance level, hence we reject the null and conclude that the residuals are not random. Whereas model 3 has a p-value slightly higher than 0.05, hence I fail to reject the null and conclude that the residuals are independent from the time series data.
+
+Therefore, only the third model is valid to forecast store 4904, for which I will create the forecast.
+
+```{r}
+store_4904.m3_forecast <- forecast(store_4904.m3, h = 14)
+```
+
+### Store 20974
+
+Finally, I will analyze store 20974. This store has several NAs and very low values of daily demand during the first two weeks of observations. This suggests inconsistent tracking of data (very low outliers) or the store not operating full time until a further date, hence I will assume that our time series starts on 16/03/2015 and disregard all previous observations. Then, the test set will consist on the last 14 observation available.
+
+Again, for this store, neither a trend nor a seasonality are observed in the graphs below.
+
+```{r}
+# Create time series starting after the 16th observation
+lettuce_20974 <- ts(data[16:nrow(data), 5], frequency = 7)
+lettuce_20974 %>% stl(s.window = "period") %>% autoplot
+
+lettuce_20974.train <- window(lettuce_20974, end = c(11, 4))
+lettuce_20974.test <- window(lettuce_20974, start = c(11, 5))
+```
+
+The $ets$ function outcome is ETS(A,N,A), which indicates that the time series data has additive error type, no trend, and additive seasonality. The Holt-Winters model has exponential smoothing with trend and additive seasonal component. As depicted below, the fitted values from the both models do not seem to match with the true values, specially for earlier observations. The gap seems to be reduced at later observations.
+
+```{r}
+lettuce_20974.HW <- HoltWinters(lettuce_20974.train)
+lettuce_20974.ets <- ets(lettuce_20974.train, model = "ZZZ") # Output: ETS(A,N,A)
+
+plot(lettuce_20974.HW, ylim = c(0, 350), main = "Holt-Winters and ETS Fitted Values for Store 20974")
+lines(fitted(lettuce_20974.ets), col = "blue")
+legend("bottomright",c("True value", "HW fitted", "ETS fitted"), lty = 1, col = c("black","red", "blue"))
+```
+
+When it comes to forecasting the next 14 days, none of the models seems to correctly predict the true values of the demand of lettuce. Although they are close at the first days, they follow a different pattern on further days. This store seems to have a lot of variation and huge spikes, which seem to be difficult to predict by these models.
+
+```{r}
+lettuce_20974.HW_forecast <- forecast(lettuce_20974.HW, h = 14)
+lettuce_20974.ets_forecast <- forecast(lettuce_20974.ets, h = 14)
+
+plot(lettuce_20974.HW_forecast, ylim = c(0, 390), main = "Store 20974 Forecast")
+lines(lettuce_20974)
+lines(lettuce_20974.ets_forecast$mean, col = "red")
+legend("topleft",c("HW FCST", "ETS FCST"), lty= 1, col = c("blue","red"))
+```
+
+I will now move into the application of ARIMA model for the last store. According to ADF, PP, and KPSS tests the training set is stationary and we do not need to take any first order difference. This is also confirmed by the $ndiffs$ function, which indicates that it is unnecessary to take a difference of the data.
+
+```{r, warning=FALSE}
+adf.test(lettuce_20974.train)
+pp.test(lettuce_20974.train)
+kpss.test(lettuce_20974.train)
+```
+
+```{r}
+ndiffs(lettuce_20974.train)
+```
+
+The result from the $nsdiffs$ function confirms my initial intuition that store 20974 does not show any trend nor a seasonality (i.e. D=0). This can also be seen in the ACF and PACF plots below, which do not show any strong seasonality.
+
+```{r}
+nsdiffs(lettuce_20974.train)
+```
+
+```{r}
+ggtsdisplay(lettuce_20974.train)
+```
+
+I move into analyzing the best and subsequent best models suggested by the $auto.arima$ function.
+
+```{r}
+auto.arima(lettuce_20974.train, trace = TRUE, d = 0, D = 0)
+```
+
+The results show:
+
+1.  Best model: ARIMA(1,0,0)(1,0,0)[7] with non-zero mean -\> AICc = 791.0354
+
+2.  Second best model: ARIMA(0,0,1)(1,0,0)[7] with non-zero mean -\> AICc = 791.8657
+
+3.  Third best model: ARIMA(1,0,0)(2,0,0)[7] with non-zero mean -\> AICc = 792.4024
+
+Then, I have plugged the parameters in the $Arima$ function to build the ARIMA models and checked the residuals.
+
+```{r}
+# three candidate models
+store_20974.m1 <- Arima(lettuce_20974.train, order = c(1, 0, 0), seasonal = list(order = c(1, 0, 0), period = 7), include.drift = FALSE)
+
+store_20974.m2 <- Arima(lettuce_20974.train, order = c(0, 0, 1), seasonal = list(order = c(1, 0, 0), period = 7), include.drift = FALSE)
+
+store_20974.m3 <- Arima(lettuce_20974.train, order = c(1, 0, 0), seasonal = list(order = c(2, 0, 0), period = 7), include.drift = FALSE)
+```
+
+```{r}
+checkresiduals(store_20974.m1, plot = FALSE)
+checkresiduals(store_20974.m2, plot = FALSE)
+checkresiduals(store_20974.m3, plot = FALSE)
+```
+
+Looking at Ljung-Box test results, all three models have a p-value which is higher than our significance level (0.05), which means that we fail to reject the null hypothesis and we conclude that the residuals from the three models are independent of the time series data, which is equal to satisfying the white noise process.
+
+Finally, I will create the fourteen days forecast for all three models whose accuracy will be evaluated in the next section.
+
+```{r}
+store_20974.m1_forecast <- forecast(store_20974.m1, h = 14)
+store_20974.m2_forecast <- forecast(store_20974.m2, h = 14)
+store_20974.m3_forecast <- forecast(store_20974.m3, h = 14)
+```
+
+## Performance Comparison and Model Selection
+
+In this section I will evaluate the accuracy of each model for each store and select the one with the lowest error (RMSE) in the test set, which indicates the best performance of the prediction.
+
+This approach is called out-of-sample performance, which refers to the ability of a predictive model to make accurate predictions on data that it has not been trained on. In other words, it measures how well the model performs on unseen or new data that was not used during the model training phase.
+
+### Store 46673
+
+For the first store in the analysis, out of the four models I evaluated the accuracy, the model ETS('ANA') has the lowest RMSE in the test set (38.53718), which indicates that it is the best model for the prediction.
+
+```{r}
+accuracy(lettuce_46673.HW_forecast, lettuce_46673.test)
+accuracy(lettuce_46673.ets_forecast, lettuce_46673.test) # best model
+accuracy(store_46673.m1_forecast, lettuce_46673.test) 
+accuracy(store_46673.m2_forecast, lettuce_46673.test) 
+```
+
+Now that the best model has been selected, I will re-calibrate the model with the entire sample. The idea is that I use the whole sample available to forecast for the next 14 days (i.e. merge train and test sets) but I keep the model specifications.
+
+Moreover, the graph below gives a visual interpretation of how this forecast looks like (black line), as well as the prediction intervals (blue shade), which are used to provide a range where the forecast is likely to be with a specific degree of confidence.
+
+```{r}
+lettuce_46673.final <- ets(lettuce_46673, model = "ANA")
+lettuce_46673.final_forecast <- forecast(lettuce_46673.final, h = 14)
+autoplot(lettuce_46673.final_forecast)
+```
+
+### Store 12631
+
+For store 12631, Holt-Winters model has the lowest RMSE (44.30622) indicating it is the best model to forecast future demand for this specific store.
+
+```{r}
+accuracy(lettuce_12631.HW_forecast, lettuce_12631.test) # best model
+accuracy(lettuce_12631.ets_forecast, lettuce_12631.test)
+accuracy(store_12631.m1_forecast, lettuce_12631.test) 
+accuracy(store_12631.m2_forecast, lettuce_12631.test) 
+accuracy(store_12631.m3_forecast, lettuce_12631.test) 
+accuracy(store_12631.m4_forecast, lettuce_12631.test)
+```
+
+I will proceed by re-calibrating the model with all the observations available for this store while keeping the model specifications. In addition, I will plot the forecast and its prediction intervals.
+
+```{r}
+lettuce_12631.final <- HoltWinters(lettuce_12631)
+lettuce_12631.final_forecast <- forecast(lettuce_12631.final, h = 14)
+autoplot(lettuce_12631.final_forecast)
+```
+
+### Store 4904
+
+For store 4904, model ETS('ANA') with RMSE = 37.75467, is the best model to predict the next fourteen days forecast.
+
+```{r}
+accuracy(lettuce_4904.HW_forecast, lettuce_4904.test)
+accuracy(lettuce_4904.ets_forecast, lettuce_4904.test) # best model
+accuracy(store_4904.m3_forecast, lettuce_4904.test) 
+```
+
+Now that the best model has been selected, I will re-calibrate the forecast using the entire sample and provide a visual interpretation.
+
+```{r}
+lettuce_4904.final <- ets(lettuce_4904, model = "ANA")
+lettuce_4904.final_forecast <- forecast(lettuce_4904.final, h = 14)
+autoplot(lettuce_4904.final_forecast)
+```
+
+### Store 20974
+
+For the last store in the analysis, the third ARIMA model has the lowest RMSE in the test set (51.51128). Hence the best model for my prediction for store 20974 is ARIMA(1,0,0)(2,0,0)[7] with non-zero mean.
+
+```{r}
+accuracy(lettuce_20974.HW_forecast, lettuce_20974.test)
+accuracy(lettuce_20974.ets_forecast, lettuce_20974.test)
+accuracy(store_20974.m1_forecast, lettuce_20974.test) 
+accuracy(store_20974.m2_forecast, lettuce_20974.test)
+accuracy(store_20974.m3_forecast, lettuce_20974.test) # best model
+```
+
+I will proceed by re-calibrating the model with all the observations available while keeping the model specifications; as well as, plot the forecast and its prediction intervals.
+
+```{r}
+store_20974.final <- Arima(lettuce_20974, order = c(1, 0, 0), seasonal = list(order = c(2, 0, 0), period = 7), include.drift = FALSE)
+store_20974.final_forecast <- forecast(store_20974.final, h = 14)
+autoplot(store_20974.final_forecast)
+```
+
+## Forecast Generation
+
+Finally, the values from all forecasts generated in the previous section has been stored in a single dataset. Values have been rounded up to the nearest integer.
+
+Final forecasted values can be seen in the snippet below or in the csv file attached.
+
+```{r}
+Store <- seq.Date(as.Date("2015-6-16"), as.Date("2015-6-29"), 'day')
+
+# Round up to the nearest integer (i.e. 703.08 must be 704)
+lettuce_forecast_final <- data.frame(
+  ceiling(lettuce_46673.final_forecast$mean),
+  ceiling(lettuce_4904.final_forecast$mean),
+  ceiling(lettuce_12631.final_forecast$mean),
+  ceiling(store_20974.final_forecast$mean)
+)
+
+colnames(lettuce_forecast_final) <- c('California 1 (ID:46673)',
+                                      'California 2 (ID:4904)',
+                                      'New York 1 (ID:12631)',
+                                      'New York 2 (ID:20974)')
+
+forecast <- cbind(Store, lettuce_forecast_final)
+
+# Visualize final output
+table <- kable(forecast, format = "html", caption = "Daily amount of lettuce forecasted per store for the next 14 days") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive"))
+table
+
+write.csv(forecast, file = "02490419.csv", row.names = FALSE)
+```
